@@ -48,25 +48,41 @@ jobs:
                   fi
 
                   BIN="$APP/PakePlus"
-                  echo "=== 校验二进制是否包含卡密相关符号 ==="
-                  # 先落盘再 grep：`strings ... | grep -q` 命中后 grep 立即退出，strings 会因 SIGPIPE
-                  # 写不出数据而返回非 0，配合 `set -o pipefail` 会让整条管道被判定为失败（误报）。
-                  STRINGS_DUMP="$RUNNER_TEMP/pakeplus.strings"
-                  strings -a "$BIN" > "$STRINGS_DUMP"
+                  if [ ! -f "$BIN" ]; then
+                    echo "❌ 未找到主程序: $BIN"
+                    exit 1
+                  fi
 
-                  check_symbol() {
-                    if grep -q -- "$1" "$STRINGS_DUMP"; then
-                      echo "✅ $1 已编入二进制"
-                    elif [ "$2" = "required" ]; then
-                      echo "❌ 二进制中没有 $1，说明相关代码没有被编译进去，请不要发布这个包"
-                      exit 1
-                    else
-                      echo "⚠️ 二进制中没有 $1（非致命，仅提示）"
+                  echo "=== 二进制信息 ==="
+                  file "$BIN"
+                  lipo -info "$BIN" || true
+
+                  echo "=== 校验卡密相关符号 ==="
+                  # 说明：不要用 `strings ... | grep -q`。grep 命中后立即退出，会让 strings 收到
+                  # SIGPIPE 返回非 0，配合 `set -o pipefail` 会把整条管道判为失败（误报）。
+                  # 这里直接用 grep -a 扫二进制（不依赖 strings），再用 nm 兜底。
+                  ensure_contains() {
+                    local name="$1"
+                    if grep -a -q -F -- "$name" "$BIN"; then
+                      echo "✅ 找到 $name"
+                      return 0
                     fi
+                    if command -v nm >/dev/null 2>&1 && nm -a "$BIN" 2>/dev/null | grep -q -- "$name"; then
+                      echo "✅ 找到 $name (nm)"
+                      return 0
+                    fi
+                    echo "❌ 二进制中没有 $name，说明相关代码没有被编译进这个包"
+                    return 1
                   }
 
-                  check_symbol "CardKeyView" required
-                  check_symbol "XbLicense" optional
+                  if ! ensure_contains "CardKeyView"; then
+                    echo "=== 调试：搜索 CardKeyView 附近的字符串 ==="
+                    grep -a -o -E '.{0,24}CardKeyView.{0,24}' "$BIN" 2>/dev/null | head -20 || true
+                    echo "请检查 CardKeyView.swift 是否加入 PakePlus target 的 Compile Sources，或被 Release 死代码剥离。"
+                    echo "不要发布这个包。"
+                    exit 1
+                  fi
+                  ensure_contains "XbLicense" || echo "⚠️ 未找到 XbLicense（非致命）"
 
                   echo "=== 校验 Info.plist 配置 ==="
                   /usr/libexec/PlistBuddy -c "Print :WEBURL" "$APP/Info.plist" || true
