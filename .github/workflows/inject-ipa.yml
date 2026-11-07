@@ -1,12 +1,13 @@
 name: Inject IPA (卡密 dylib 一键注入 + 签名)
 
 # git / GitHub Actions 版「IPA 一键注入」：
-#   1) 用 macOS Runner 自带的 Xcode 工具链把卡密守护 dylib（ios/kami）编译成 arm64；
-#   2) 用 zsign 把 dylib 注入目标 IPA（LC_LOAD_DYLIB）并重新签名；
-#   3) 产物作为 Artifact 下载。
-# 基础 IPA 用「下载地址」或「仓库内路径」二选一；dylib 默认由源码编译，
-# 也可以用 dylib_url / dylib_path 指定外部 dylib 覆盖。
-# 签名：adhoc（免证书，配 TrollStore，要求 IPA 已解密）或 cert（用 Secrets 的 p12 + 描述文件）。
+#   1) 用 macOS Runner 自带 Xcode 把卡密 dylib（ios/kami）编译成 arm64；
+#   2) 把可自定义的 HTML 登录页放进 App 包内 kami/index.html；
+#   3) 用 zsign 注入 dylib（LC_LOAD_DYLIB）并重新签名；
+#   4) 产物作为 Artifact 下载。
+# HTML 模板：默认用仓库里的 ios/kami/index.html，也可用 html_url 指定外部模板；
+#           页面通过 window.Android.verifyCardKey2/writeSP/Toast/close/openUrl 调原生。
+# 签名：adhoc（免证书，配 TrollStore，要求 IPA 已解密）或 cert（Secrets 的 p12 + 描述文件）。
 
 on:
     workflow_dispatch:
@@ -19,6 +20,14 @@ on:
                 description: '仓库内基础 IPA 路径（ipa_url 为空时使用）'
                 required: false
                 default: ''
+            html_url:
+                description: '可选：HTML 模板下载地址（留空则用 html_path）'
+                required: false
+                default: ''
+            html_path:
+                description: '仓库内 HTML 模板路径'
+                required: false
+                default: 'ios/kami/index.html'
             sign_mode:
                 description: '签名方式：adhoc 或 cert'
                 required: true
@@ -31,7 +40,7 @@ on:
                 description: '可选：修改 Bundle ID（一般留空）'
                 required: false
                 default: ''
-            # ---- 卡密平台对接参数（用于编译 dylib 时的配置）----
+            # ---- 卡密平台对接参数（编译 dylib 用）----
             soft:
                 description: '识别码'
                 required: false
@@ -41,7 +50,7 @@ on:
                 required: false
                 default: 'NKCZzdLiikYjiE78k2V6nncRfjVB57GZ'
             aes_key:
-                description: 'AES密钥（>16位自动取前16位做 AES-128）'
+                description: 'AES密钥（>16位自动取前16位）'
                 required: false
                 default: 'HL1MAZDPXijHJqkaayNHbW1OYEHL0bqa'
             aes_iv:
@@ -53,11 +62,11 @@ on:
                 required: false
                 default: '123[data]456[key]789'
             endpoints:
-                description: '接口地址（英文逗号分隔，留空用默认 api2/3/4）'
+                description: '接口地址（英文逗号分隔）'
                 required: false
                 default: 'https://api2.xbzhan.com/api/login,https://api3.xbzhan.com/api/login,https://api4.xbzhan.com/api/login'
             heart_seconds:
-                description: '心跳间隔(秒)，建议小于后台周期(如180)，默认150'
+                description: '心跳间隔(秒)，建议小于后台周期(如180)'
                 required: false
                 default: '150'
             heart_on:
@@ -114,7 +123,6 @@ jobs:
                   set -eo pipefail
                   mkdir -p ios/kami
 
-                  # 用输入生成配置（注意：值里不要带英文双引号）
                   SOFT="${{ inputs.soft }}"
                   SKEY="${{ inputs.skey }}"
                   AESKEY="${{ inputs.aes_key }}"
@@ -156,11 +164,39 @@ jobs:
                   xcrun --sdk iphoneos clang \
                     -arch arm64 -dynamiclib \
                     -isysroot "$SDK" -mios-version-min=12.0 -fobjc-arc -O2 \
-                    -framework Foundation -framework UIKit \
+                    -framework Foundation -framework UIKit -framework WebKit \
                     -o "$RUNNER_TEMP/libkami.dylib" \
                     ios/kami/kami.m ios/kami/xb_config.m
                   file "$RUNNER_TEMP/libkami.dylib"
                   echo "DYLIB=$RUNNER_TEMP/libkami.dylib" >> "$GITHUB_ENV"
+
+            - name: Inject HTML template into app bundle
+              run: |
+                  set -eo pipefail
+                  HTML_SRC=""
+                  if [ -n "${{ inputs.html_url }}" ]; then
+                    echo "下载 HTML 模板: ${{ inputs.html_url }}"
+                    curl -fL --retry 3 -o "$RUNNER_TEMP/index.html" "${{ inputs.html_url }}"
+                    HTML_SRC="$RUNNER_TEMP/index.html"
+                  elif [ -n "${{ inputs.html_path }}" ] && [ -f "${{ inputs.html_path }}" ]; then
+                    HTML_SRC="${{ inputs.html_path }}"
+                  fi
+                  if [ -z "$HTML_SRC" ]; then echo "未提供 HTML 模板，使用 dylib 内置兜底页"; exit 0; fi
+
+                  WORK="$RUNNER_TEMP/ipa_work"
+                  rm -rf "$WORK"; mkdir -p "$WORK"
+                  unzip -q "$IPA" -d "$WORK"
+                  APP="$(find "$WORK/Payload" -maxdepth 1 -type d -name '*.app' | head -n 1)"
+                  if [ -z "$APP" ]; then echo "::error::IPA 内没有找到 .app"; exit 1; fi
+                  echo "目标 App: $APP"
+                  mkdir -p "$APP/kami"
+                  cp "$HTML_SRC" "$APP/kami/index.html"
+                  rm -rf "$APP/_CodeSignature"
+                  OUT="$RUNNER_TEMP/ipa_html.ipa"
+                  rm -f "$OUT"
+                  ( cd "$WORK" && zip -qry "$OUT" Payload )
+                  file "$OUT"
+                  echo "IPA=$OUT" >> "$GITHUB_ENV"
 
             - name: Build zsign
               run: |

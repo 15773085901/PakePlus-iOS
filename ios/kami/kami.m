@@ -1,14 +1,20 @@
-// iOS 卡密验证 dylib（小白网络验证协议）
+// iOS 卡密验证 dylib（小白网络验证协议，WKWebView + 可自定义 HTML）
+//
 // 编译：xcrun --sdk iphoneos clang -arch arm64 -dynamiclib -fobjc-arc \
-//         -framework Foundation -framework UIKit -mios-version-min=12.0 \
-//         -o libkami.dylib kami.m xb_config.m
+//         -framework Foundation -framework UIKit -framework WebKit \
+//         -mios-version-min=12.0 -o libkami.dylib kami.m xb_config.m
 //
 // 登录协议：AES-128-CBC(JSON) -> hex，sign = md5("123"+hex+"456"+软件秘钥+"789")
+// 页面 HTML 从 App 包内的 kami/index.html 读取（没有则用内置兜底页）。
+// 页面通过 window.Android.xxx 调用原生（dylib 在 documentStart 注入 shim）：
+//   Android.verifyCardKey2(soft, url, card, cbName)
+//   Android.writeSP(key, value) / Android.Toast(msg) / Android.close() / Android.openUrl(url)
 // 登录成功后定时心跳 /api/heartbeat；校验失败或超时直接 exit(0)。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <WebKit/WebKit.h>
 #import <CommonCrypto/CommonCryptor.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <stdlib.h>
@@ -101,6 +107,25 @@ static NSString *XBRandomHex(int len) {
     NSMutableString *s = [NSMutableString stringWithCapacity:len];
     for (int i = 0; i < len; i++) [s appendFormat:@"%c", hx[arc4random_uniform(16)]];
     return s;
+}
+
+// 生成一个可直接嵌入 JS 的双引号字符串
+static NSString *XBJSString(NSString *s) {
+    if (!s) s = @"";
+    NSMutableString *o = [NSMutableString stringWithString:@"\""];
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        switch (c) {
+            case '"': [o appendString:@"\\\""]; break;
+            case '\\': [o appendString:@"\\\\"]; break;
+            case '\n': [o appendString:@"\\n"]; break;
+            case '\r': [o appendString:@"\\r"]; break;
+            case '\t': [o appendString:@"\\t"]; break;
+            default: [o appendFormat:@"%C", c]; break;
+        }
+    }
+    [o appendString:@"\""];
+    return o;
 }
 
 #pragma mark - Device
@@ -290,9 +315,7 @@ static XbResult *XBHeartbeat(NSString *card, NSString *cookie) {
 static NSUserDefaults *XBPrefs(void) { return [NSUserDefaults standardUserDefaults]; }
 
 static void XBDie(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        exit(0);
-    });
+    dispatch_async(dispatch_get_main_queue(), ^{ exit(0); });
     exit(0);
 }
 
@@ -333,16 +356,54 @@ static void XBStartHeartbeat(NSString *card) {
     });
 }
 
-#pragma mark - Login UI
+#pragma mark - Web Login UI
+
+static NSString *XBShimJS(void) {
+    return @"(function(){if(window.Android)return;"
+            "window.Android={"
+            "verifyCardKey2:function(soft,url,card,cb){window.webkit.messageHandlers.Android.postMessage({action:'verify',soft:String(soft||''),url:String(url||''),card:String(card||''),cb:String(cb||'onCardVerify')});},"
+            "writeSP:function(k,v){window.webkit.messageHandlers.Android.postMessage({action:'writeSP',key:String(k||''),value:String(v||'')});},"
+            "getSP:function(k){return '';},"
+            "Toast:function(m){window.webkit.messageHandlers.Android.postMessage({action:'toast',msg:String(m||'')});},"
+            "close:function(){window.webkit.messageHandlers.Android.postMessage({action:'close'});},"
+            "openUrl:function(u){window.webkit.messageHandlers.Android.postMessage({action:'openUrl',url:String(u||'')});}"
+            "};})();";
+}
+
+static NSString *XBFallbackHTML(void) {
+    return @"<!doctype html><html><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>"
+            "<style>body{margin:0;background:#f4f6fb;font-family:-apple-system,'PingFang SC',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh}"
+            ".c{width:88%;max-width:360px;background:#fff;border-radius:16px;padding:24px;box-shadow:0 8px 30px rgba(0,0,0,.12)}"
+            "h2{margin:0 0 16px;font-size:19px;color:#222}input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #dcdfe6;border-radius:8px;font-size:15px}"
+            "button{width:100%;margin-top:14px;padding:13px;border:0;border-radius:10px;color:#fff;font-size:16px;background:linear-gradient(90deg,#007aff,#00aaff)}"
+            "p{color:#999;font-size:13px;text-align:center;margin-top:12px;min-height:18px}</style></head><body>"
+            "<div class='c'><h2>授权验证</h2><input id='k' placeholder='请输入卡密' autocomplete='off'/>"
+            "<button id='b'>立即验证 →</button><p id='s'></p></div>"
+            "<script>var b=document.getElementById('b'),k=document.getElementById('k'),s=document.getElementById('s');"
+            "b.onclick=function(){var c=k.value.trim();if(!c){s.textContent='请输入卡密';return;}b.disabled=true;b.textContent='验证中...';"
+            "window.Android.verifyCardKey2('', '', c, 'onCardVerify');};"
+            "function onCardVerify(ok,code,body){b.disabled=false;b.textContent='立即验证 →';if(ok&&body==='ok'){s.textContent='验证成功';window.Android.writeSP('kami',k.value.trim());window.Android.close();}else{s.textContent=body||'验证失败';}}"
+            "var saved=window.Android.getSP('kami');</script></body></html>";
+}
+
+static NSString *XBLoadHTML(void) {
+    NSString *p = [[NSBundle mainBundle] pathForResource:@"index" ofType:@"html" inDirectory:@"kami"];
+    if (!p) p = [[NSBundle mainBundle] pathForResource:@"index" ofType:@"html"];
+    if (p) {
+        NSString *s = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+        if (s.length > 0) return s;
+    }
+    return XBFallbackHTML();
+}
 
 @class XbLoginViewController;
 static XbLoginViewController *gLoginVC = nil;
 
-@interface XbLoginViewController : UIViewController
-@property (nonatomic, strong) UITextField *field;
-@property (nonatomic, strong) UIButton *button;
-@property (nonatomic, strong) UILabel *status;
-@property (nonatomic, strong) UIActivityIndicatorView *spinner;
+@interface XbLoginViewController : UIViewController <WKScriptMessageHandler>
+@property (nonatomic, strong) WKWebView *web;
+@property (nonatomic, strong) UILabel *toast;
+@property (nonatomic, strong) NSString *pendingCB;
 @property (nonatomic) BOOL busy;
 @end
 
@@ -352,144 +413,120 @@ static XbLoginViewController *gLoginVC = nil;
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor colorWithRed:0.956 green:0.965 blue:0.984 alpha:1.0];
 
-    CAGradientLayer *bg = [CAGradientLayer layer];
-    bg.frame = self.view.bounds;
-    bg.colors = @[(__bridge id)[UIColor colorWithRed:0.0 green:0.478 blue:1.0 alpha:1.0].CGColor,
-                  (__bridge id)[UIColor colorWithRed:0.0 green:0.667 blue:1.0 alpha:1.0].CGColor];
-    bg.startPoint = CGPointMake(0, 0);
-    bg.endPoint = CGPointMake(1, 1);
-    [self.view.layer insertSublayer:bg atIndex:0];
-    self.view.tag = 9991;
+    WKWebViewConfiguration *cfg = [[WKWebViewConfiguration alloc] init];
+    cfg.userContentController = [[WKUserContentController alloc] init];
+    [cfg.userContentController addScriptMessageHandler:self name:@"Android"];
+    [cfg.userContentController addUserScript:[[WKUserScript alloc] initWithSource:XBShimJS()
+                                                                    injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                                                 forMainFrameOnly:YES]];
 
-    [self buildUI];
+    WKWebView *web = [[WKWebView alloc] initWithFrame:self.view.bounds configuration:cfg];
+    web.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    web.opaque = NO;
+    web.backgroundColor = [UIColor clearColor];
+    web.scrollView.bounces = NO;
+    [self.view addSubview:web];
+    self.web = web;
+
+    [web loadHTMLString:XBLoadHTML() baseURL:[NSURL fileURLWithPath:[[NSBundle mainBundle] bundlePath]]];
+
+    self.toast = [[UILabel alloc] initWithFrame:CGRectZero];
+    self.toast.backgroundColor = [UIColor colorWithWhite:0 alpha:0.8];
+    self.toast.textColor = [UIColor whiteColor];
+    self.toast.font = [UIFont systemFontOfSize:14];
+    self.toast.textAlignment = NSTextAlignmentCenter;
+    self.toast.layer.cornerRadius = 16;
+    self.toast.clipsToBounds = YES;
+    self.toast.alpha = 0;
+    [self.view addSubview:self.toast];
 }
 
-- (void)buildUI {
-    CGFloat w = self.view.bounds.size.width;
-    CGFloat cw = MIN(w - 48, 360);
-    CGFloat x = (w - cw) / 2;
-    CGFloat y = self.view.bounds.size.height * 0.30;
-
-    UIView *card = [[UIView alloc] initWithFrame:CGRectMake(x, y, cw, 300)];
-    card.backgroundColor = [UIColor whiteColor];
-    card.layer.cornerRadius = 16;
-    card.layer.shadowColor = [UIColor blackColor].CGColor;
-    card.layer.shadowOpacity = 0.18;
-    card.layer.shadowRadius = 18;
-    card.layer.shadowOffset = CGSizeMake(0, 8);
-    card.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin;
-    [self.view addSubview:card];
-
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(20, 24, cw - 40, 28)];
-    title.text = @"授权验证";
-    title.font = [UIFont boldSystemFontOfSize:19];
-    title.textColor = [UIColor colorWithWhite:0.13 alpha:1.0];
-    [card addSubview:title];
-
-    UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(20, 54, cw - 40, 18)];
-    sub.text = @"请输入卡密后点击验证";
-    sub.font = [UIFont systemFontOfSize:13];
-    sub.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
-    [card addSubview:sub];
-
-    self.field = [[UITextField alloc] initWithFrame:CGRectMake(20, 86, cw - 40, 46)];
-    self.field.placeholder = @"请输入卡密";
-    self.field.borderStyle = UITextBorderStyleRoundedRect;
-    self.field.autocapitalizationType = UITextAutocapitalizationTypeNone;
-    self.field.autocorrectionType = UITextAutocorrectionTypeNo;
-    self.field.clearButtonMode = UITextFieldViewModeWhileEditing;
-    self.field.returnKeyType = UIReturnKeyDone;
-    [card addSubview:self.field];
-
-    self.button = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.button.frame = CGRectMake(20, 150, cw - 40, 48);
-    [self.button setTitle:@"立即验证 →" forState:UIControlStateNormal];
-    [self.button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    self.button.titleLabel.font = [UIFont boldSystemFontOfSize:16];
-    self.button.backgroundColor = [UIColor colorWithRed:0.0 green:0.478 blue:1.0 alpha:1.0];
-    self.button.layer.cornerRadius = 10;
-    [self.button addTarget:self action:@selector(onVerify) forControlEvents:UIControlEventTouchUpInside];
-    [card addSubview:self.button];
-
-    self.status = [[UILabel alloc] initWithFrame:CGRectMake(20, 208, cw - 40, 18)];
-    self.status.font = [UIFont systemFontOfSize:13];
-    self.status.textColor = [UIColor colorWithWhite:0.55 alpha:1.0];
-    self.status.textAlignment = NSTextAlignmentCenter;
-    [card addSubview:self.status];
-
-    self.spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleGray];
-    self.spinner.center = CGPointMake(cw / 2, 250);
-    self.spinner.hidesWhenStopped = YES;
-    [card addSubview:self.spinner];
-
-    UILabel *copy = [[UILabel alloc] initWithFrame:CGRectMake(x, y + 316, cw, 18)];
-    copy.text = @"木子插件 © 2026";
-    copy.font = [UIFont systemFontOfSize:12];
-    copy.textColor = [UIColor colorWithWhite:1.0 alpha:0.9];
-    copy.textAlignment = NSTextAlignmentCenter;
-    copy.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin;
-    [self.view addSubview:copy];
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    self.web.frame = self.view.bounds;
+    self.toast.frame = CGRectMake((self.view.bounds.size.width - 200) / 2, self.view.bounds.size.height - 110, 200, 36);
 }
 
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
     NSString *saved = [XBPrefs() stringForKey:kPrefsCard];
     if (saved.length > 0) {
-        self.field.text = saved;
+        NSString *js = [NSString stringWithFormat:@"(function(){try{var e=document.getElementById('activeCode')||document.getElementById('k');if(e){e.value=%@;}}catch(x){}})();", XBJSString(saved)];
+        [self.web evaluateJavaScript:js completionHandler:nil];
         [self doVerify:saved silent:YES];
     }
 }
 
-- (void)onVerify {
-    if (self.busy) return;
-    [self.field resignFirstResponder];
-    NSString *card = [self.field.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (card.length == 0) { self.status.text = @"请输入卡密"; return; }
-    [self doVerify:card silent:NO];
+- (void)showToast:(NSString *)msg {
+    if (msg.length == 0) return;
+    self.toast.text = msg;
+    self.toast.alpha = 1;
+    [UIView animateWithDuration:0.25 delay:1.2 options:0 animations:^{
+        self.toast.alpha = 0;
+    } completion:nil];
+}
+
+- (void)userContentController:(WKUserContentController *)userContentController didReceiveScriptMessage:(WKScriptMessage *)message {
+    if (![message.name isEqualToString:@"Android"]) return;
+    id body = message.body;
+    if (![body isKindOfClass:[NSDictionary class]]) return;
+    NSDictionary *d = (NSDictionary *)body;
+    NSString *action = d[@"action"];
+    if ([action isEqualToString:@"verify"]) {
+        NSString *card = d[@"card"];
+        NSString *cb = d[@"cb"];
+        self.pendingCB = (cb.length > 0) ? cb : @"onCardVerify";
+        card = [card stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (card.length == 0) { [self showToast:@"请输入卡密"]; [self callJS:NO code:-1 msg:@"请输入卡密"]; return; }
+        [self doVerify:card silent:NO];
+    } else if ([action isEqualToString:@"writeSP"]) {
+        NSString *k = d[@"key"]; NSString *v = d[@"value"];
+        if (k.length > 0) [XBPrefs() setObject:(v ?: @"") forKey:[@"xb_sp_" stringByAppendingString:k]];
+    } else if ([action isEqualToString:@"toast"]) {
+        [self showToast:d[@"msg"]];
+    } else if ([action isEqualToString:@"close"]) {
+        [self dismissLogin];
+    } else if ([action isEqualToString:@"openUrl"]) {
+        NSString *u = d[@"url"];
+        NSURL *url = [NSURL URLWithString:u];
+        if (url) [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+    }
+}
+
+- (void)callJS:(BOOL)ok code:(NSInteger)code msg:(NSString *)msg {
+    NSString *cb = self.pendingCB.length > 0 ? self.pendingCB : @"onCardVerify";
+    NSString *js = [NSString stringWithFormat:@"(function(){try{var f=window.%@;if(typeof f==='function'){f(%@,%ld,%@,'');}}catch(e){}})();",
+                    cb, ok ? @"true" : @"false", (long)code, XBJSString(msg ?: @"")];
+    [self.web evaluateJavaScript:js completionHandler:nil];
 }
 
 - (void)doVerify:(NSString *)card silent:(BOOL)silent {
     if (self.busy) return;
     self.busy = YES;
-    self.button.enabled = NO;
-    [self.button setTitle:@"验证中..." forState:UIControlStateNormal];
-    self.status.text = @"正在连接服务器...";
-    [self.spinner startAnimating];
-
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         XbResult *r = XBLogin(card);
         dispatch_async(dispatch_get_main_queue(), ^{
             self.busy = NO;
-            self.button.enabled = YES;
-            [self.button setTitle:@"立即验证 →" forState:UIControlStateNormal];
-            [self.spinner stopAnimating];
+            [self callJS:r.success code:r.code msg:(r.success ? @"ok" : r.msg)];
             if (r.success) {
                 [XBPrefs() setObject:card forKey:kPrefsCard];
                 if (r.cookie.length > 0) [XBPrefs() setObject:r.cookie forKey:kPrefsCookie];
-                self.status.text = @"验证成功";
+                [self showToast:@"验证成功"];
                 XBStartHeartbeat(card);
-                [self dismissViewControllerAnimated:NO completion:^{
-                    gLoginVC = nil;
-                }];
-            } else {
-                self.status.text = r.msg.length > 0 ? r.msg : @"验证失败";
-                if (!silent) {
-                    CGFloat cx = self.field.center.x;
-                    [UIView animateWithDuration:0.07 animations:^{
-                        self.field.center = CGPointMake(cx - 8, self.field.center.y);
-                    } completion:^(BOOL f) {
-                        [UIView animateWithDuration:0.07 animations:^{
-                            self.field.center = CGPointMake(cx + 8, self.field.center.y);
-                        } completion:^(BOOL f2) {
-                            [UIView animateWithDuration:0.07 animations:^{
-                                self.field.center = CGPointMake(cx, self.field.center.y);
-                            }];
-                        }];
-                    }];
-                }
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    [self dismissLogin];
+                });
+            } else if (!silent) {
+                [self showToast:(r.msg.length > 0 ? r.msg : @"验证失败")];
             }
         });
     });
+}
+
+- (void)dismissLogin {
+    if (gLoginVC != self && gLoginVC != nil) { return; }
+    gLoginVC = nil;
+    [self dismissViewControllerAnimated:NO completion:nil];
 }
 
 @end
@@ -508,7 +545,6 @@ static void XBTryPresent(void) {
         UIViewController *root = win.rootViewController;
         if (!root) return;
         if (root.presentedViewController) {
-            // 已经在展示别的界面，稍后再试
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 XBTryPresent();
             });
